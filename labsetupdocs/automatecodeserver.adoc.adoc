@@ -1,0 +1,323 @@
+= Automating Multi-User Code-server Setup with GitHub Actions
+:toc-level:2
+
+This guide provides instructions for automating the deployment of a multi-user `code-server` environment on AWS using GitHub Actions. Each user will have an isolated `code-server` instance, accessible via a domain and configured for iframe embedding with Nginx.
+
+== Prerequisites
+
+- AWS credentials with permissions to create and configure EC2 instances.
+- SSH key pair for connecting to EC2 (stored as a GitHub Secret).
+- Domain name set up for SSL and access configuration.
+- Basic knowledge of GitHub Actions and Ansible (for automated configuration).
+
+== Step 1: Prepare Your GitHub Repository
+
+1. **Create a `.github/workflows` Directory**:
+   - Inside your repository, add a directory named `.github/workflows` to hold GitHub Actions workflow files.
+
+2. **Store Secrets in GitHub**:
+   - Go to **Settings** > **Secrets and Variables** > **Actions** in your GitHub repository.
+   - Add the following secrets:
+     - `AWS_ACCESS_KEY_ID`: AWS access key.
+     - `AWS_SECRET_ACCESS_KEY`: AWS secret key.
+     - `EC2_KEY_PAIR`: SSH private key for connecting to the instance.
+     - `DOMAIN_NAME`: Your domain name (e.g., `your-domain.com`).
+     - `USER_PASSWORD`: The base password for users.
+     - `EC2_INSTANCE_ID`: (Optional) if using an existing instance.
+
+== Step 2: Define GitHub Actions Workflow
+
+In the `.github/workflows` directory, create a workflow file named `setup-code-server.yml` with the following content:
+
+```yaml
+name: Setup Multi-User Code-server Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: 'AWS EC2 Instance Type'
+        required: false
+        default: 't3.medium'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Set up EC2 instance
+        id: ec2-setup
+        uses: aws-actions/aws-ec2@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: us-east-1
+          instance-type: ${{ github.event.inputs.instance_type }}
+          key-name: ${{ secrets.EC2_KEY_PAIR }}
+          ami-id: ami-12345678 # Replace with the Ubuntu AMI ID for your region
+
+      - name: Configure Code-server for Multiple Users
+        env:
+          EC2_IP: ${{ steps.ec2-setup.outputs.public-ip }}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i "${{ secrets.EC2_KEY_PAIR }}" ubuntu@${{ env.EC2_IP }} << EOF
+          # Update and install necessary packages
+          sudo apt update && sudo apt install -y nginx certbot python3-certbot-nginx
+
+          # Install code-server
+          curl -fsSL https://code-server.dev/install.sh | sh
+
+          # Create user accounts and configure code-server for each
+          for i in $(seq 1 20); do
+            username="user$i"
+            sudo adduser --disabled-password --gecos "" $username
+            echo "${username}:${{ secrets.USER_PASSWORD }}" | sudo chpasswd
+
+            # Set up code-server for each user
+            sudo mkdir -p /home/$username/.config/code-server
+            sudo chown -R $username:$username /home/$username/.config/code-server
+            echo -e "bind-addr: 0.0.0.0:808$i\npassword: '${{ secrets.USER_PASSWORD }}'\n" | sudo tee /home/$username/.config/code-server/config.yaml
+
+            # Create a systemd service for each user
+            echo "[Unit]
+            Description=VS Code Server for $username
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=$username
+            ExecStart=/usr/bin/code-server --bind-addr 0.0.0.0:808$i --config /home/$username/.config/code-server/config.yaml
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target" | sudo tee /etc/systemd/system/code-server-$username.service
+
+            sudo systemctl enable code-server-$username
+            sudo systemctl start code-server-$username
+          done
+          EOF
+
+      - name: Configure Nginx with SSL and iframe Embedding
+        env:
+          EC2_IP: ${{ steps.ec2-setup.outputs.public-ip }}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i "${{ secrets.EC2_KEY_PAIR }}" ubuntu@${{ env.EC2_IP }} << EOF
+          # Configure Nginx for reverse proxy and SSL
+          echo "server {
+              listen 80;
+              server_name ${{ secrets.DOMAIN_NAME }};
+              location / {
+                  return 301 https://\$host\$request_uri;
+              }
+          }
+
+          server {
+              listen 443 ssl;
+              server_name ${{ secrets.DOMAIN_NAME }};
+              ssl_certificate /etc/letsencrypt/live/${{ secrets.DOMAIN_NAME }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${{ secrets.DOMAIN_NAME }}/privkey.pem;
+
+              location / {
+                  proxy_pass http://localhost:8080/;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_hide_header X-Frame-Options;
+                  add_header X-Frame-Options "ALLOWALL";
+              }
+
+              # Add locations for each user
+              $(for i in $(seq 1 20); do
+                echo "location /user$i/ {
+                    proxy_pass http://localhost:808$i/;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    proxy_hide_header X-Frame-Options;
+                    add_header X-Frame-Options 'ALLOWALL';
+                }"
+              done)
+          }" | sudo tee /etc/nginx/sites-available/code-server
+
+          # Enable Nginx configuration and SSL
+          sudo ln -s /etc/nginx/sites-available/code-server /etc/nginx/sites-enabled/
+          sudo nginx -t
+          sudo systemctl restart nginx
+          sudo certbot --nginx -d ${{ secrets.DOMAIN_NAME }} --non-interactive --agree-tos --email your-email@example.com
+
+          # Test renewal
+          sudo certbot renew --dry-run
+          EOF
+
+
+== Explanation of Key Steps
+
+EC2 Setup:
+The workflow launches an EC2 instance (or uses an existing one if EC2_INSTANCE_ID is set) and installs code-server along with required packages.
+User Creation and Code-server Configuration:
+The workflow iterates over 20 users (user1 to user20), creating each user with a systemd service for code-server on a unique port.
+Nginx Configuration with SSL and iframe:
+Nginx is configured as a reverse proxy for each user, with SSL enabled using Let’s Encrypt. The X-Frame-Options header is modified to allow iframe embedding.
+
+
+= Running the Multi-User Code-server Automation Workflow with GitHub Actions
+
+This guide explains how to set up, configure, and execute the GitHub Actions workflow to automate a multi-user `code-server` environment on AWS with Nginx, SSL, and iframe embedding.
+
+== Step 1: Set Up Your GitHub Repository
+
+1. **Create a New Repository** (or use an existing one) on GitHub where this workflow will reside.
+2. **Add the Workflow File**:
+   - In your repository, create the following file path and add the workflow file:
+     ```
+     .github/workflows/setup-code-server.yml
+     ```
+   - Copy and paste the workflow content provided in the `setup-code-server.yml` file and save it.
+
+== Step 2: Configure GitHub Secrets
+
+1. **Navigate to Repository Secrets**:
+   - Go to **Settings** > **Secrets and Variables** > **Actions** in your GitHub repository.
+   
+2. **Add the Required Secrets**:
+   - **AWS_ACCESS_KEY_ID**: Your AWS access key ID with permissions to manage EC2.
+   - **AWS_SECRET_ACCESS_KEY**: Your AWS secret access key.
+   - **EC2_KEY_PAIR**: Paste the full contents of your `.pem` file (SSH private key) here to allow SSH connections.
+   - **DOMAIN_NAME**: The domain name pointing to your EC2 instance (e.g., `your-domain.com`).
+   - **USER_PASSWORD**: A base password that will be set for all user accounts on `code-server`.
+   - **Optional**: `EC2_INSTANCE_ID` if you want to use an existing instance instead of creating a new one.
+
+== Step 3: Run the Workflow
+
+1. **Trigger the Workflow**:
+   - Go to the **Actions** tab in your GitHub repository.
+   - Select the **Setup Multi-User Code-server Environment** workflow from the left sidebar.
+   - Click **Run workflow** to manually trigger it. You can specify an EC2 instance type or use the default (`t3.medium`).
+
+2. **Monitor the Workflow**:
+   - Monitor each step as it runs in real-time. Key steps include:
+     - Provisioning the EC2 instance or using an existing instance.
+     - Configuring each user’s `code-server` instance on a unique port.
+     - Setting up Nginx to manage reverse proxy, SSL, and iframe embedding.
+
+3. **Workflow Steps Overview**:
+   - **Set up EC2 Instance**: Launches or connects to an EC2 instance.
+   - **Configure Code-server for Multiple Users**: Creates 20 user accounts, each with a dedicated `code-server` instance.
+   - **Configure Nginx with SSL and iframe Embedding**: Configures Nginx for each user with SSL from Let’s Encrypt.
+
+== Step 4: Verify the Setup
+
+Once the workflow completes successfully, your setup will be accessible at the domain specified in the `DOMAIN_NAME` secret.
+
+1. **Access Each User's Code-server Instance**:
+   - Each user should be accessible via URLs like:
+     ```
+     https://your-domain.com/user1/?password=USER_PASSWORD
+     https://your-domain.com/user2/?password=USER_PASSWORD
+     ```
+   
+2. **Test SSL and iframe Embedding**:
+   - Open the URLs in an iframe to confirm that `X-Frame-Options` are set correctly and the site is accessible with SSL.
+
+== Troubleshooting Tips
+
+- **EC2 Instance Errors**: If the EC2 setup fails, check the IAM permissions for your AWS credentials to ensure they allow EC2 creation and management.
+- **SSL Issues**: If Let’s Encrypt SSL setup fails, ensure your domain’s DNS records point to the EC2 instance IP and that DNS propagation is complete.
+- **Nginx Configuration**: If users aren’t accessible, verify the Nginx configuration by connecting to the EC2 instance and running `sudo nginx -t` and `sudo systemctl status nginx`.
+
+== Summary
+
+This GitHub Actions workflow automates the setup of a multi-user `code-server` environment, providing each user with isolated instances accessible via SSL and embeddable in iframes. This setup ensures secure and scalable access for multiple users on a single EC2 instance.
+
+= Domain Configuration Guide for Multi-User Code-server Setup
+
+This guide explains how to configure your domain in GoDaddy (or another provider) to point to an AWS EC2 instance for the `code-server` environment. It covers DNS record setup, SSL certificate prerequisites, and testing.
+
+== Step 1: Log in to Your Domain Provider Account
+
+1. **Log in to GoDaddy** (or your domain provider).
+   - Navigate to [GoDaddy](https://godaddy.com) and sign in to your account.
+
+2. **Access DNS Settings**:
+   - Locate the domain you want to use for your `code-server` setup.
+   - Open the **DNS Management** or **DNS Settings** panel for this domain.
+
+== Step 2: Configure DNS Records
+
+To map your domain to the public IP address of your AWS EC2 instance, configure the following DNS records:
+
+1. **Add an A Record**:
+   - An A record maps your domain (e.g., `your-domain.com`) to the IP address of your EC2 instance.
+
+   - **Host**: `@` (or leave blank to represent the root domain, e.g., `your-domain.com`).
+   - **Points to**: The public IP address of your EC2 instance. This IP can be found in your AWS EC2 Console under the **Public IPv4 address** section.
+   - **TTL**: Set to the default (typically 1 hour).
+
+2. **Add a CNAME Record (Optional)**:
+   - A CNAME record can map `www.your-domain.com` to your root domain (`your-domain.com`). This allows access to your `code-server` setup with or without the `www` prefix.
+
+   - **Host**: `www`
+   - **Points to**: `your-domain.com`
+   - **TTL**: Set to the default.
+
+3. **Save Changes**:
+   - Save your DNS settings after adding or updating records. DNS changes typically take a few minutes to a few hours to propagate, depending on the **TTL** setting.
+
+== Step 3: Verify DNS Configuration
+
+1. **Test Domain Propagation**:
+   - To check if the domain points to your EC2 instance, use a DNS propagation tool such as [DNSChecker.org](https://dnschecker.org).
+   - Enter your domain (`your-domain.com`) and verify that the A record points to your EC2 IP address globally.
+
+2. **Check Domain Resolution Locally**:
+   - You can also verify by running the following command in your terminal:
+
+     ```bash
+     nslookup your-domain.com
+     ```
+
+   - This command should return the IP address of your EC2 instance.
+
+== Step 4: Set Up SSL Using Let’s Encrypt (GitHub Actions Workflow)
+
+Once the domain is mapped to your EC2 instance, SSL certificates can be automatically set up with Let’s Encrypt using the GitHub Actions workflow provided.
+
+1. **Prerequisite for SSL**:
+   - Ensure that your domain fully resolves to your EC2 instance IP (verify with Step 3).
+   - The GitHub Actions workflow will use Certbot to request and configure SSL certificates automatically.
+
+2. **Run the GitHub Actions Workflow**:
+   - Trigger the **Setup Multi-User Code-server Environment** workflow in your GitHub repository.
+   - This workflow will:
+     - Verify that the domain points to your EC2 IP.
+     - Use Certbot to generate SSL certificates with Let’s Encrypt for `your-domain.com`.
+     - Configure Nginx with SSL settings and reverse proxy for each `code-server` user instance.
+
+== Step 5: Test the SSL Setup
+
+After the workflow completes, verify that your domain is accessible via HTTPS:
+
+1. **Open Your Domain in a Browser**:
+   - Visit `https://your-domain.com` in a browser to confirm that SSL is active.
+
+2. **Access Each User’s `code-server` Instance**:
+   - Each user instance should be accessible via URLs like:
+     ```
+     https://your-domain.com/user1/?password=USER_PASSWORD
+     https://your-domain.com/user2/?password=USER_PASSWORD
+     ```
+   - The `X-Frame-Options` header in Nginx is configured to allow iframe embedding, so you can embed these URLs in iframes if needed.
+
+== Troubleshooting Domain and SSL Issues
+
+- **DNS Not Resolving**: If your domain is not pointing to the EC2 IP, double-check your A record and ensure that DNS propagation is complete.
+- **SSL Certificate Issues**: If the SSL certificate fails to generate, confirm that the domain resolves correctly. You can rerun the GitHub Actions workflow to re-attempt SSL configuration.
+
+== Summary
+
+You’ve configured your GoDaddy (or similar) domain to point to your AWS EC2 instance and enabled SSL. Your multi-user `code-server` environment is now accessible at `your-domain.com` with secure HTTPS access.
