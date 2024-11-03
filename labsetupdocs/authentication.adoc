@@ -1,0 +1,245 @@
+= Multi-User Code-server Setup with Custom Login, Nginx Reverse Proxy, and iframe Embedding
+
+This guide provides a step-by-step setup for deploying a multi-user `code-server` environment with a custom login page, using Nginx as a reverse proxy to manage each user’s instance with SSL, iframe embedding, and direct workspace access.
+
+== Overview
+
+This setup involves:
+- A custom login page that authenticates users and redirects them to their `code-server` instance.
+- A Node.js app to verify credentials.
+- Nginx configuration for proxying, SSL, and allowing iframe embedding.
+
+== Prerequisites
+
+- An Ubuntu server (AWS EC2 or similar) with root access.
+- A domain registered and pointing to the server (e.g., through GoDaddy).
+- Basic knowledge of Linux commands, Node.js, and server configuration.
+
+== Step 1: Set Up Node.js Authentication Server
+
+. **Install Node.js and Express**:
++
+[source,bash]
+----
+sudo apt update
+sudo apt install nodejs npm -y
+npm install express
+----
+
+. **Create an App Directory**:
++
+[source,bash]
+----
+mkdir code-server-auth
+cd code-server-auth
+----
+
+. **Create Authentication Server Script (server.js)**:
++
+[source,javascript]
+----
+const express = require("express");
+const app = express();
+const port = 3000;
+
+app.use(express.json());
+
+// Hardcoded user credentials (replace with a secure method in production)
+const users = {
+    user1: "user1_password",
+    user2: "user2_password"
+};
+
+// Authentication endpoint
+app.post("/authenticate", (req, res) => {
+    const { username, password } = req.body;
+
+    if (users[username] && users[username] === password) {
+        const redirectUrl = `https://your-domain.com/${username}/?password=${password}`;
+        res.json({ success: true, redirectUrl });
+    } else {
+        res.json({ success: false, message: "Invalid username or password" });
+    }
+});
+
+app.listen(port, () => {
+    console.log(`Authentication server running at http://localhost:${port}`);
+});
+----
+
+. **Install Dependencies and Start the Server**:
++
+[source,bash]
+----
+npm install express
+node server.js
+----
+
+This starts the authentication server on `http://localhost:3000`.
+
+== Step 2: Create Custom HTML Login Page
+
+. **Create Login Page (login.html)**:
+   Save the following HTML to `/var/www/html/login.html`.
+
++
+[source,html]
+----
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login to VS Code Server</title>
+    <style>
+        body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f4f4f4; }
+        #loginForm { width: 300px; padding: 20px; background: white; border-radius: 8px; box-shadow: 0px 0px 10px rgba(0,0,0,0.1); }
+        input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; }
+        button { width: 100%; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #45a049; }
+        #errorMessage { color: red; display: none; }
+    </style>
+</head>
+<body>
+    <form id="loginForm" onsubmit="handleLogin(event)">
+        <h2>Login to VS Code Server</h2>
+        <input type="text" id="username" placeholder="Username" required>
+        <input type="password" id="password" placeholder="Password" required>
+        <button type="submit">Login</button>
+        <p id="errorMessage">Invalid username or password</p>
+    </form>
+
+    <script>
+        async function handleLogin(event) {
+            event.preventDefault();
+            const username = document.getElementById("username").value;
+            const password = document.getElementById("password").value;
+
+            try {
+                const response = await fetch("/authenticate", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ username, password })
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    window.location.href = result.redirectUrl;
+                } else {
+                    document.getElementById("errorMessage").style.display = "block";
+                }
+            } catch (error) {
+                console.error("Error:", error);
+            }
+        }
+    </script>
+</body>
+</html>
+----
+
+This login page sends a POST request to `/authenticate` and, upon successful login, redirects to the user's VS Code workspace.
+
+== Step 3: Configure Nginx
+
+. **Update the Nginx Configuration**:
+   Configure Nginx to serve the login page, proxy the authentication server, and handle iframe embedding.
+
+[source,nginx]
+----
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # Serve the custom login page
+    location = / {
+        root /var/www/html;
+        index login.html;
+    }
+
+    # Proxy requests to the Node.js authentication server
+    location /authenticate {
+        proxy_pass http://localhost:3000/authenticate;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Redirect HTTP to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name your-domain.com;
+
+    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Serve the custom login page
+    location = / {
+        root /var/www/html;
+        index login.html;
+    }
+
+    # Proxy requests to the Node.js authentication server
+    location /authenticate {
+        proxy_pass http://localhost:3000/authenticate;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Proxy user code-server instances with iframe embedding
+    location /user1/ {
+        proxy_pass http://localhost:8081/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_hide_header X-Frame-Options;
+        add_header X-Frame-Options "ALLOWALL";
+    }
+
+    location /user2/ {
+        proxy_pass http://localhost:8082/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_hide_header X-Frame-Options;
+        add_header X-Frame-Options "ALLOWALL";
+    }
+
+    # Add more locations as needed
+}
+----
+
+. **Reload Nginx**:
++
+[source,bash]
+----
+sudo nginx -t
+sudo systemctl reload nginx
+----
+
+== Testing and Verification
+
+- Access the custom login page by visiting `https://your-domain.com`.
+- Log in with valid credentials, confirming redirection to the VS Code workspace.
+- Test embedding the workspace URL in an iframe.
+
+== Additional Considerations
+
+- **Security of Credentials**: Hardcoded credentials should be replaced with a database in production, along with password hashing (e.g., bcrypt).
+- **HTTPS**: Ensure all login and authentication endpoints use HTTPS to secure transmitted data.
+- **Rate Limiting**: Implement rate limiting on the authentication endpoint to prevent brute-force attacks.
+- **Logging**: Enable logging for authentication requests to monitor activity.
+
+== Summary
+
+This setup allows for a custom login experience with a secure and iframe-embeddable `code-server` deployment using Nginx. Follow each step to implement authentication, proxying, SSL, and custom login functionality.
+
