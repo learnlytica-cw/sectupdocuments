@@ -1,5 +1,5 @@
 = Automating Multi-User Code-server Setup with GitHub Actions
-:toc-level:2
+
 
 This guide provides instructions for automating the deployment of a multi-user `code-server` environment on AWS using GitHub Actions. Each user will have an isolated `code-server` instance, accessible via a domain and configured for iframe embedding with Nginx.
 
