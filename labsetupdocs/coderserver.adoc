@@ -1,0 +1,248 @@
+= Multi-User Code-server Setup with Nginx Reverse Proxy, Domain Mapping, and iframe Embedding
+
+This guide provides a comprehensive setup for deploying a multi-user `code-server` environment, using Nginx as a reverse proxy to manage each user’s instance with SSL, domain mapping, and iframe embedding. Each user will have a separate workspace, accessible securely through a custom domain.
+
+== Prerequisites
+
+- AWS EC2 instance (or any cloud instance) running Ubuntu
+- Domain registered with GoDaddy
+- Basic knowledge of Linux commands and server configuration
+
+== Step 1: Configure GoDaddy Domain to Point to Your Server
+
+1. **Log in to GoDaddy**:
+   - Go to [GoDaddy's website](https://godaddy.com) and log into your account.
+
+2. **Access DNS Settings**:
+   - From your GoDaddy dashboard, find the domain you want to use and open its DNS settings.
+
+3. **Add an A Record**:
+   - Create an **A record** that points to your EC2 instance’s public IP address.
+   - Set the **Host** field to `@` if you want to use the root domain (e.g., `your-domain.com`).
+   - **Points to**: Enter your EC2 instance’s public IP.
+   - **TTL**: Set to the default value (e.g., 1 hour).
+
+4. **(Optional) Add a CNAME Record**:
+   - If you want to set up `www.your-domain.com` as well, create a **CNAME record**:
+     - **Host**: Set to `www`
+     - **Points to**: Set to your root domain (e.g., `your-domain.com`).
+     - **TTL**: Use the default setting.
+
+5. **Allow Time for DNS Propagation**:
+   - DNS changes may take a few minutes to a few hours to propagate, depending on the TTL.
+
+Once your domain is configured, you can proceed with setting up `code-server` on your server and configuring Nginx.
+
+== Step 2: Install Code-server and Set Up Multi-User Instances
+
+For each user, create a unique `code-server` instance running on a different port.
+
+1. Install `code-server` (if not installed):
+
+    ```bash
+    curl -fsSL https://code-server.dev/install.sh | sh
+    ```
+
+2. Create separate users (`user1`, `user2`, etc.):
+
+    ```bash
+    sudo adduser user1
+    sudo adduser user2
+    sudo adduser user3
+    ```
+
+3. Configure `code-server` for each user:
+
+    a. Create a `.config/code-server` directory for each user:
+
+    ```bash
+    sudo mkdir -p /home/user1/.config/code-server
+    sudo mkdir -p /home/user2/.config/code-server
+    sudo mkdir -p /home/user3/.config/code-server
+    ```
+
+    b. Set ownership:
+
+    ```bash
+    sudo chown -R user1:user1 /home/user1/.config/code-server
+    sudo chown -R user2:user2 /home/user2/.config/code-server
+    sudo chown -R user3:user3 /home/user3/.config/code-server
+    ```
+
+    c. Create `config.yaml` for each user, assigning a unique port and password.
+
+    For `user1`:
+
+    ```yaml
+    bind-addr: 0.0.0.0:8081
+    password: "user1_password"
+    ```
+
+    For `user2`:
+
+    ```yaml
+    bind-addr: 0.0.0.0:8082
+    password: "user2_password"
+    ```
+
+4. Create Systemd services for each `code-server` instance:
+
+    ```bash
+    sudo nano /etc/systemd/system/code-server-user1.service
+    ```
+
+    Add the following:
+
+    ```ini
+    [Unit]
+    Description=VS Code Server for user1
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=user1
+    ExecStart=/usr/bin/code-server --bind-addr 0.0.0.0:8081 --config /home/user1/.config/code-server/config.yaml
+    Restart=always
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+    Repeat for each user, updating the port and `User`.
+
+5. Enable and start each `code-server` service:
+
+    ```bash
+    sudo systemctl enable code-server-user1
+    sudo systemctl start code-server-user1
+    sudo systemctl enable code-server-user2
+    sudo systemctl start code-server-user2
+    ```
+
+== Step 3: Install and Configure Nginx for SSL and iframe Embedding
+
+1. Install Nginx:
+
+    ```bash
+    sudo apt update
+    sudo apt install nginx -y
+    ```
+
+2. Configure Nginx to route requests to each user’s `code-server` instance.
+
+    Create an Nginx config file:
+
+    ```bash
+    sudo nano /etc/nginx/sites-available/code-server
+    ```
+
+3. Add the following configuration, replacing `<port>` with the ports for each user’s instance.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name your-domain.com www.your-domain.com;
+
+        # Redirect HTTP to HTTPS
+        location / {
+            return 301 https://$host$request_uri;
+        }
+    }
+
+    server {
+        listen 443 ssl;
+        server_name your-domain.com www.your-domain.com;
+
+        ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+        include /etc/letsencrypt/options-ssl-nginx.conf;
+        ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+        # User 1's code-server instance
+        location /user1/ {
+            proxy_pass http://localhost:8081/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Remove X-Frame-Options to allow embedding
+            proxy_hide_header X-Frame-Options;
+            add_header X-Frame-Options "ALLOWALL";
+        }
+
+        # User 2's code-server instance
+        location /user2/ {
+            proxy_pass http://localhost:8082/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Remove X-Frame-Options to allow embedding
+            proxy_hide_header X-Frame-Options;
+            add_header X-Frame-Options "ALLOWALL";
+        }
+
+        # Add additional locations for other users as needed
+    }
+    ```
+
+4. Link the configuration and reload Nginx:
+
+    ```bash
+    sudo ln -s /etc/nginx/sites-available/code-server /etc/nginx/sites-enabled/
+    sudo nginx -t
+    sudo systemctl reload nginx
+    ```
+
+== Step 4: Set Up SSL with Let’s Encrypt
+
+1. Install Certbot for automatic SSL management:
+
+    ```bash
+    sudo apt install certbot python3-certbot-nginx -y
+    ```
+
+2. Obtain an SSL certificate:
+
+    ```bash
+    sudo certbot --nginx -d your-domain.com -d www.your-domain.com
+    ```
+
+3. Test automatic renewal:
+
+    ```bash
+    sudo certbot renew --dry-run
+    ```
+
+== Step 5: Access code-server Instances for Each User
+
+1. Each `code-server` instance is accessible with unique URLs:
+
+    - User 1: `https://your-domain.com/user1/?password=user1_password`
+    - User 2: `https://your-domain.com/user2/?password=user2_password`
+
+2. To embed in an iframe, use the following code:
+
+    ```html
+    <iframe src="https://your-domain.com/user1/?password=user1_password" width="100%" height="600px"></iframe>
+    ```
+
+== Troubleshooting
+
+- If Nginx fails to start, check for configuration errors:
+
+    ```bash
+    sudo nginx -t
+    ```
+
+- Verify `code-server` instances are running:
+
+    ```bash
+    sudo systemctl status code-server-user1
+    ```
+
+== Summary
+
+You’ve successfully set up a multi-user `code-server` environment with Nginx, SSL, domain mapping through GoDaddy, and iframe embedding. This environment allows secure, isolated workspaces for each user, accessible from a custom domain.
